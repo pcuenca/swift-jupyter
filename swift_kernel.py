@@ -29,6 +29,7 @@ import tempfile
 import textwrap
 import time
 import threading
+import errno
 
 from ipykernel.kernelbase import Kernel
 from jupyter_client.jsonutil import squash_dates
@@ -82,10 +83,11 @@ class PreprocessorError(ExecutionResultError):
 class PreprocessorException(Exception):
     pass
 
-
 class PackageInstallException(Exception):
     pass
 
+class PackageSpecException(Exception):
+    pass
 
 class SwiftError(ExecutionResultError):
     """There was a compile or runtime error."""
@@ -341,6 +343,16 @@ class SwiftKernel(Kernel):
             self._handle_enable_completion()
             return ''
 
+        list_installed_packages_match = re.match(r'^\s*%listInstalledPackages\s*$', line)
+        if list_installed_packages_match is not None:
+            self._handle_list_installed_packages()
+            return ''
+
+        create_package_match = re.match(r'^\s*%createPackageSpec (.*)$', line)
+        if create_package_match is not None:
+            self._handle_create_package_spec(create_package_match.group(1))
+            return ''
+
         return line
 
     def _read_include(self, line_index, rest_of_line):
@@ -593,6 +605,103 @@ class SwiftKernel(Kernel):
             'text': 'Installation complete!\n'
         })
         self.already_installed_packages = True
+
+    def _installed_packages(self):
+        if not hasattr(self, 'already_installed_packages') or not self.already_installed_packages:
+            raise PackageInstallException(
+                    'No packages installed.')
+
+        swift_import_search_path = os.environ.get('SWIFT_IMPORT_SEARCH_PATH')
+        if swift_import_search_path is None:
+            raise PackageInstallException(
+                    'Package installation not supported - '
+                    'SWIFT_IMPORT_SEARCH_PATH is not specified.')
+
+        scratchwork_base_path = os.path.dirname(swift_import_search_path)
+        package_base_path = os.path.join(scratchwork_base_path, 'package')
+
+        resolved_package_path = os.path.join(package_base_path, 'Package.resolved')
+        try:
+            with open(resolved_package_path, "r") as resolved_file:
+                data = json.load(resolved_file)
+                for pin in data['object']['pins']:
+                    package = pin['package'].split('.')[0]
+                    version = pin['state']['version']
+                    repositoryURL = pin['repositoryURL']
+                    yield package, version, repositoryURL
+        except Exception:
+            raise PackageInstallException('Package installation data not found')
+
+    def _handle_list_installed_packages(self):
+        try:
+            self._do_list_installed_packages()
+        except PackageInstallException as e:
+            self.send_response(self.iopub_socket, 'stream', {
+                'name': 'stderr',
+                'text': str(e)
+            })
+
+    def _do_list_installed_packages(self):
+        for (package, version, repositoryURL) in self._installed_packages():
+            self.send_response(self.iopub_socket, 'stream', {
+                'name': 'stdout',
+                'text': f'Package {package} @ {version} from {repositoryURL}\n'
+            })
+
+    def _handle_create_package_spec(self, outfile):
+        try:
+            self._do_create_package_spec(outfile)
+            self.send_response(self.iopub_socket, 'stream', {
+                'name': 'stdout',
+                'text': f'Prepared Swift Package skeleton at {outfile}'
+            })
+        except PackageSpecException as e:
+            self.send_response(self.iopub_socket, 'stream', {
+                'name': 'stderr',
+                'text': str(e)
+            })
+
+    def _do_create_package_spec(self, target):
+        try:
+            deps = ''
+            dep_names = []
+            for (package, version, repositoryURL) in self._installed_packages():
+                deps += f'.package(url: "{repositoryURL}", from: "{version}"), '
+                dep_names.append(package)
+
+            dep_list = ', '.join([f'"{d}"' for d in dep_names])
+            package_spec = textwrap.dedent(f"""\
+                // swift-tools-version:4.2
+                import PackageDescription
+
+                let package = Package(
+                    name: "{target}",
+                    products: [
+                        .library(name: "{target}", targets: ["{target}"]),
+                    ],
+                    dependencies: [{deps}],
+                    targets: [
+                        .target(
+                            name: "{target}",
+                            dependencies: [{dep_list}]),
+                    ]
+                )
+                """)
+
+            # Create target structure, if necessary
+            try:
+                sources_path = os.path.join(target, 'Sources')
+                sources_path = os.path.join(sources_path, os.path.basename(target))
+                os.makedirs(sources_path)
+            except OSError as oserror:
+                if oserror.errno != errno.EEXIST:
+                    raise oserror
+
+            output_package = os.path.join(target, 'Package.swift')
+            with open(output_package, 'w') as out:
+                out.write(package_spec)
+        except Exception as e:
+            raise PackageSpecException(f'Could not create SPM Package specification at {target}: {e}')
 
     def _execute(self, code):
         locationDirective = '#sourceLocation(file: "%s", line: 1)' % (
