@@ -30,6 +30,7 @@ import tempfile
 import textwrap
 import time
 import threading
+import pickle
 
 from ipykernel.kernelbase import Kernel
 from jupyter_client.jsonutil import squash_dates
@@ -192,12 +193,41 @@ class SwiftKernel(Kernel):
         self._init_kernel_communicator()
         self._init_int_bitwidth()
         self._init_sigint_handler()
+        self._init_installed_packages()
 
         # We do completion by default when the toolchain has the
         # SBTarget.CompleteCode API.
         # The user can disable/enable using "%disableCompletion" and
         # "%enableCompletion".
         self.completion_enabled = hasattr(self.target, 'CompleteCode')
+
+    def _init_installed_packages(self):
+        # == dlopen the shared lib prepared during package install ==
+
+        swift_import_search_path = os.environ.get('SWIFT_IMPORT_SEARCH_PATH')
+        if swift_import_search_path is None:
+            return
+        lib_filename = os.path.join(os.path.dirname(swift_import_search_path), 'libjupyterInstalledPackages.so')
+        if not os.path.isfile(lib_filename):
+            return
+
+        self.send_response(self.iopub_socket, 'stream', {
+            'name': 'stdout',
+            'text': 'Loading library...\n'
+            })
+        dynamic_load_code = textwrap.dedent("""\
+                import func Glibc.dlopen
+            dlopen(%s, RTLD_NOW)
+        """ % json.dumps(lib_filename))
+        dynamic_load_result = self._execute(dynamic_load_code)
+        if not isinstance(dynamic_load_result, SuccessWithValue):
+            raise PackageInstallException(
+                    'Install Error: dlopen error: %s' % \
+                            str(dynamic_load_result))
+        if dynamic_load_result.result.description.strip() == 'nil':
+            raise PackageInstallException('Install Error: dlopen error. Run '
+        '`String(cString: dlerror())` to see '
+                                        'the error message.')
 
     def _init_repl_process(self):
         self.debugger = lldb.SBDebugger.Create()
@@ -509,7 +539,7 @@ class SwiftKernel(Kernel):
         # - ask SwiftPM to build that package
         # - copy all the .swiftmodule and module.modulemap files that SwiftPM
         #   created to SWIFT_IMPORT_SEARCH_PATH
-        # - dlopen the .so file that SwiftPM created
+        # - Copy the .so file that SwiftPM created to be dlopened later
 
         # == Create the SwiftPM package ==
 
@@ -534,10 +564,23 @@ class SwiftKernel(Kernel):
                 ])
         """)
 
+        # Get dependencies compiled in previous sessions and append the new ones
+        compiled_deps_file = os.path.join(scratchwork_base_path, '.deps.pkl')
+        deps = set()
+        try:
+            with open(compiled_deps_file, "rb") as f:
+                deps = pickle.load(f)
+        except IOError:
+            pass
+        
         packages_specs = ''
         packages_products = ''
         packages_human_description = ''
         for package in packages:
+            deps.add(json.dumps(package))
+
+        for package in deps:
+            package = json.loads(package)
             packages_specs += '%s,\n' % package['spec']
             packages_human_description += '\t%s\n' % package['spec']
             for target in package['products']:
@@ -613,32 +656,14 @@ class SwiftKernel(Kernel):
             os.makedirs(modulemap_dest, exist_ok=True)
             shutil.copy(filename, modulemap_dest)
 
-        # == dlopen the shared lib ==
+        # Copy .so file too, so it can be loaded even if no packages were compiled
+        shutil.copy(lib_filename, os.path.dirname(swift_import_search_path))
 
-        self.send_response(self.iopub_socket, 'stream', {
-            'name': 'stdout',
-            'text': 'Initializing Swift...\n'
-        })
-        self._init_swift()
+        # Update the persistent list of installed packages
+        # FIXME: handle IOError. how?
+        with open(compiled_deps_file, "wb") as f:
+            pickle.dump(deps, f)
 
-        dynamic_load_code = textwrap.dedent("""\
-            import func Glibc.dlopen
-            dlopen(%s, RTLD_NOW)
-        """ % json.dumps(lib_filename))
-        dynamic_load_result = self._execute(dynamic_load_code)
-        if not isinstance(dynamic_load_result, SuccessWithValue):
-            raise PackageInstallException(
-                    'Install Error: dlopen error: %s' % \
-                            str(dynamic_load_result))
-        if dynamic_load_result.result.description.strip() == 'nil':
-            raise PackageInstallException('Install Error: dlopen error. Run '
-                                        '`String(cString: dlerror())` to see '
-                                        'the error message.')
-
-        self.send_response(self.iopub_socket, 'stream', {
-            'name': 'stdout',
-            'text': 'Installation complete!\n'
-        })
         self.already_installed_packages = True
 
     def _execute(self, code):
